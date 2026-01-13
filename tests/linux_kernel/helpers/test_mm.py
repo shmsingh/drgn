@@ -17,7 +17,6 @@ from _drgn_util.platform import NORMALIZED_MACHINE_NAME
 from drgn import NULL, FaultError, ObjectNotFoundError
 from drgn.helpers.linux.device import dev_name
 from drgn.helpers.linux.mm import (
-    _MEMORY_BLOCK_STATE,
     PFN_PHYS,
     PHYS_PFN,
     PageCompound,
@@ -32,6 +31,7 @@ from drgn.helpers.linux.mm import (
     compound_nr,
     compound_order,
     decode_memory_block_state,
+    decode_memory_block_state_value,
     decode_page_flags,
     environ,
     find_vmap_area,
@@ -53,6 +53,7 @@ from drgn.helpers.linux.mm import (
     phys_to_page,
     phys_to_virt,
     task_rss,
+    task_vsize,
     totalram_pages,
     virt_to_page,
     virt_to_pfn,
@@ -600,6 +601,15 @@ class TestMm(LinuxKernelTestCase):
             # margin.
             self.assertAlmostEqual(rss_info.total, stats["VmRSS"], delta=delta * 3)
 
+    def test_task_vsize(self):
+        with fork_and_stop() as pid:
+            task = find_task(self.prog, pid)
+            vsize = task_vsize(task)
+            text = Path(f"/proc/{pid}/status").read_text()
+            value = re.findall(r"^VmSize:\s*([0-9]+)", text, flags=re.MULTILINE)
+            if value:
+                self.assertEqual(vsize, int(value[0]) * 1024)
+
     @skip_unless_have_memory_hotplug
     def test_for_each_memory_block(self):
         self.assertCountEqual(
@@ -609,16 +619,6 @@ class TestMm(LinuxKernelTestCase):
             ],
             os.listdir(b"/sys/bus/memory/devices"),
         )
-
-    @skip_unless_have_test_kmod
-    def test_memory_block_states(self):
-        for value, name in _MEMORY_BLOCK_STATE.items():
-            with self.subTest(state=name):
-                try:
-                    expected = self.prog["drgn_test_" + name].value_()
-                except ObjectNotFoundError:
-                    self.skipTest(f"{name} is not defined")
-                self.assertEqual(value, expected)
 
     @skip_unless_have_memory_hotplug
     def test_decode_memory_block_state(self):
@@ -636,6 +636,25 @@ class TestMm(LinuxKernelTestCase):
             .read_text()
             .strip(),
         )
+
+    @skip_unless_have_test_kmod
+    def test_decode_memory_block_state_value(self):
+        for name in (
+            "MEM_ONLINE",
+            "MEM_GOING_OFFLINE",
+            "MEM_OFFLINE",
+            "MEM_GOING_ONLINE",
+            "MEM_CANCEL_ONLINE",
+            "MEM_CANCEL_OFFLINE",
+            "MEM_PREPARE_ONLINE",
+            "MEM_FINISH_OFFLINE",
+        ):
+            with self.subTest(state=name):
+                try:
+                    state = self.prog["drgn_test_" + name]
+                except ObjectNotFoundError:
+                    self.skipTest(f"{name} is not defined")
+                self.assertEqual(decode_memory_block_state_value(state), name)
 
     @skip_unless_have_memory_hotplug
     def test_memory_block_size_bytes(self):

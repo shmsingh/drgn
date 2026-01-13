@@ -178,17 +178,20 @@ class CommandFormatter:
                 if (
                     name == "drgn.commands.command"
                     or name == "drgn.commands.custom_command"
+                    or name == "drgn.commands.raw_command"
                 ):
                     namespace = ""
                 elif (
-                    name == "drgn.commands.linux_kernel_command"
-                    or name == "drgn.commands.linux_kernel_custom_command"
+                    name == "drgn.commands.linux.linux_kernel_command"
+                    or name == "drgn.commands.linux.linux_kernel_custom_command"
+                    or name == "drgn.commands.linux.linux_kernel_raw_command"
                 ):
                     namespace = ""
                     enabled = "linux"
                 elif (
                     name == "drgn.commands.crash.crash_command"
                     or name == "drgn.commands.crash.crash_custom_command"
+                    or name == "drgn.commands.crash.crash_raw_command"
                 ):
                     namespace = "crash"
                 else:
@@ -653,7 +656,18 @@ class CommandFormatter:
                     self._format_argument(lines, node)
                 elif type == "drgn.commands.mutually_exclusive_group":
                     for type, node in self._group_arguments(command, node):
-                        visit_positional_argument(type, node)
+                        if type == "drgn.commands.argument":
+                            self._format_argument(lines, node)
+                        elif type == "drgn.commands.argument_group":
+                            _log_unrecognized_input(
+                                "argument_group cannot be child of mutually_exclusive_group"
+                            )
+                        elif type == "drgn.commands.mutually_exclusive_group":
+                            _log_unrecognized_input(
+                                "mutually_exclusive_group cannot be child of mutually_exclusive_group"
+                            )
+                        else:
+                            assert_never(type)
                 elif type == "drgn.commands.argument_group":
                     _log_unrecognized_input(
                         "argument_group cannot be child of argument_group"

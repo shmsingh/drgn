@@ -5,24 +5,27 @@
 
 import argparse
 import functools
-import shutil
 import sys
-from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 from drgn import Object, Program, offsetof, sizeof
 from drgn.commands import CommandError, _repr_black, argument, drgn_argument
 from drgn.commands.crash import (
+    _PID_OR_TASK,
     Cpuspec,
     CrashDrgnCodeBuilder,
+    _crash_foreach_subcommand,
     _guess_type,
+    _guess_type_name,
+    _object_format_options,
     _parse_members,
     _parse_type_name_and_members,
     _parse_type_offset_arg,
     _pid_or_task,
     _prefer_object_lookup,
     _sanitize_member_name,
+    _TaskSelector,
     crash_command,
-    crash_get_context,
     parse_cpuspec,
     print_task_header,
 )
@@ -132,7 +135,6 @@ address = prog.symbol({_repr_black(address_or_symbol)}).address{subtract_offset}
         code.add_from_import("drgn", "Object")
         code.append(f"{initial_object(hex(address) + subtract_offset)}\n")
 
-    members_indent = ""
     if isinstance(offset_arg, tuple):
         offset_name, offset_member = offset_arg
         after = "[0]" if object_or_pointer == "object" else ""
@@ -141,10 +143,7 @@ address = prog.symbol({_repr_black(address_or_symbol)}).address{subtract_offset}
             offset_type_name = type_name
         else:
             code.add_from_import("drgn", "reinterpret")
-            try:
-                offset_type_name = _guess_type(prog, offset_name).type_name()
-            except LookupError:
-                offset_type_name = "struct " + offset_name
+            offset_type_name = _guess_type_name(prog, offset_name)
             if object_or_pointer == "object":
                 after += f'\n{pcpu_prefix}object = reinterpret("{type_name}", {pcpu_prefix}object)'
             else:
@@ -153,32 +152,36 @@ address = prog.symbol({_repr_black(address_or_symbol)}).address{subtract_offset}
             f'{pcpu_prefix}{object_or_pointer} = container_of(offset_pointer, "{offset_type_name}", "{offset_member}"){after}\n'
         )
 
-    if args.count == 1:
-        object_loop = ""
-    else:
-        members_indent = "    "
-        loop_body = "" if members else "    ...\n"
+    if cpuspec is not None:
+        code.begin_cpuspec_loop(cpuspec)
+        code.add_from_import("drgn.helpers.linux.percpu", per_cpu_helper)
+        code.append(
+            f"{object_or_pointer} = {per_cpu_helper}({pcpu_prefix}{object_or_pointer}, cpu)\n"
+        )
+
+    if args.count != 1:
         if args.count >= 0:
             slice_str = f":{args.count}"
         else:
             slice_str = f"{args.count + 1}:1"
-        object_loop = f"for object in pointer[{slice_str}]:\n{loop_body}"
+        code.begin_block(f"for object in pointer[{slice_str}]:\n")
 
-    object_loop += "".join(
-        [
-            f"{members_indent}{_sanitize_member_name(member)} = object.{member}\n"
-            for member in members
-        ]
+    code.append(
+        "".join(
+            [
+                f"{_sanitize_member_name(member)} = object.{member}\n"
+                for member in members
+            ]
+        )
     )
 
-    if cpuspec is None:
-        code.append(object_loop)
-    else:
-        code.add_from_import("drgn.helpers.linux.percpu", per_cpu_helper)
-        code.append_cpuspec(
-            cpuspec,
-            f"{object_or_pointer} = {per_cpu_helper}({pcpu_prefix}{object_or_pointer}, cpu)\n{object_loop}",
-        )
+    if args.count != 1:
+        if not members:
+            code.append("...\n")
+        code.end_block()
+
+    if cpuspec is not None:
+        code.end_block()
 
     code.print()
     return
@@ -346,11 +349,7 @@ def _crash_cmd_struct(
                 print(f"[{cpu}]: {pcpu_ptr.value_():x}")
                 yield pcpu_ptr[sl]
 
-    format_options = {
-        "columns": shutil.get_terminal_size().columns,
-        "dereference": False,
-        "integer_base": args.integer_base or prog.config.get("crash_radix", 10),
-    }
+    format_options = _object_format_options(prog, args.integer_base)
     for arr in arrays():
         for i, obj in enumerate(arr):
             if i != 0:
@@ -477,6 +476,72 @@ def _crash_cmd_asterisk(
     return _crash_cmd_struct(prog, name, args, **kwargs)
 
 
+@_crash_foreach_subcommand(
+    arguments=(
+        argument(
+            "-R",
+            dest="members",
+            metavar="member[,member]",
+            action="append",
+        ),
+        argument(
+            "-x",
+            dest="integer_base",
+            action="store_const",
+            const=16,
+        ),
+        argument(
+            "-d",
+            dest="integer_base",
+            action="store_const",
+            const=10,
+        ),
+        drgn_argument,
+    ),
+)
+def _crash_foreach_task(task_selector: _TaskSelector, args: argparse.Namespace) -> None:
+    prog = task_selector.prog
+
+    members = []
+    if args.members:
+        for arg in args.members:
+            members.extend(_parse_members(arg))
+
+    if args.drgn:
+        code = CrashDrgnCodeBuilder(prog)
+        with task_selector.begin_task_loop(code):
+            code.append_task_header()
+            if members:
+                for member in members:
+                    code.append(f"{_sanitize_member_name(member)} = task.{member}\n")
+            else:
+                code.add_from_import("drgn.helpers.linux.sched", "task_thread_info")
+                code.append("thread_info = task_thread_info(task)\n")
+        return code.print()
+
+    format_options = _object_format_options(prog, args.integer_base)
+
+    first = True
+    for task in task_selector.tasks():
+        if first:
+            first = False
+        else:
+            print()
+
+        print_task_header(task)
+        if members:
+            for member in members:
+                print(
+                    f"  {member} = {task[0].subobject_(member).format_(**format_options)}"
+                )
+        else:
+            print(
+                task[0].format_(**format_options),
+                task_thread_info(task)[0].format_(**format_options),
+                sep="\n\n",
+            )
+
+
 @crash_command(
     description="task_struct and thread_info contents",
     arguments=(
@@ -521,69 +586,16 @@ def _crash_cmd_asterisk(
 def _crash_cmd_task(
     prog: Program, name: str, args: argparse.Namespace, **kwargs: Any
 ) -> None:
-    members = []
-    if args.members:
-        for arg in args.members:
-            members.extend(_parse_members(arg))
-
-    task_args: List[Optional[Tuple[Literal["pid", "task"], int]]] = []
+    task_args: List[Optional[_PID_OR_TASK]] = []
     for arg in args.tasks:
         try:
             task_args.append(_pid_or_task(arg))
         except ValueError:
-            members.extend(_parse_members(arg))
+            if args.members is None:
+                args.members = [arg]
+            else:
+                args.members.append(arg)
 
     if not task_args:
         task_args.append(None)
-
-    if args.drgn:
-        code = CrashDrgnCodeBuilder(prog)
-        if not members:
-            code.add_from_import("drgn.helpers.linux.sched", "task_thread_info")
-        first = True
-        for task_arg in task_args:
-            if first:
-                first = False
-            else:
-                code.append("\n")
-
-            code.append_crash_context(task_arg)
-            code.append_task_header()
-            if members:
-                for member in members:
-                    code.append(f"{_sanitize_member_name(member)} = task.{member}\n")
-            else:
-                code.append("thread_info = task_thread_info(task)\n")
-        return code.print()
-
-    format_options = {
-        "columns": shutil.get_terminal_size().columns,
-        "dereference": False,
-        "integer_base": args.integer_base or prog.config.get("crash_radix", 10),
-    }
-
-    first = True
-    for task_arg in task_args:
-        if first:
-            first = False
-        else:
-            print()
-
-        try:
-            task = crash_get_context(prog, task_arg)
-        except Exception as e:
-            print(e)
-            continue
-
-        print_task_header(task)
-        if members:
-            for member in members:
-                print(
-                    f"  {member} = {task[0].subobject_(member).format_(**format_options)}"
-                )
-        else:
-            print(
-                task[0].format_(**format_options),
-                task_thread_info(task)[0].format_(**format_options),
-                sep="\n\n",
-            )
+    return _crash_foreach_task(_TaskSelector(prog, task_args), args)

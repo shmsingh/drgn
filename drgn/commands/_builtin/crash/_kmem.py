@@ -37,7 +37,7 @@ from drgn.commands import (
     drgn_argument,
     mutually_exclusive_group,
 )
-from drgn.commands._builtin.crash._sys import _SysPrinter
+from drgn.commands._builtin.crash._sys import _print_sys
 from drgn.commands.crash import (
     CrashDrgnCodeBuilder,
     _parse_members,
@@ -134,7 +134,7 @@ def _kmem_free(prog: Program, drgn_arg: bool, show_pages: bool = False) -> None:
         code.add_from_import(
             "drgn.helpers.linux.vmstat", "nr_free_pages", "zone_page_state"
         )
-        code.append(
+        with code.begin_block(
             """\
 actual_free_pages = 0
 for pgdat in for_each_online_pgdat():
@@ -152,24 +152,27 @@ for pgdat in for_each_online_pgdat():
             block_size = prog["PAGE_SIZE"] << order
             for migrate_type, free_list in enumerate(free_area.free_list):
 """
-        )
-        if show_pages:
-            code.add_from_import(
-                "drgn.helpers.linux.list", "validate_list_for_each_entry"
-            )
-            loop_body = """\
-                num_blocks = 0
-                for page in validate_list_for_each_entry(
-                    "struct page", free_list.address_of_(), "lru"
-                ):
-                    num_blocks += 1
+        ), code.begin_retry_loop_if_live(100):
+            if show_pages:
+                code.add_from_import(
+                    "drgn.helpers.linux.list", "validate_list_for_each_entry"
+                )
+                code.append(
+                    """\
+num_blocks = 0
+for page in validate_list_for_each_entry(
+    "struct page", free_list.address_of_(), "lru"
+):
+    num_blocks += 1
 """
-        else:
-            code.add_from_import("drgn.helpers.linux.list", "validate_list_count_nodes")
-            loop_body = """\
-                num_blocks = validate_list_count_nodes(free_list.address_of_())
-"""
-        code.append_retry_loop_if_live(loop_body, 100)
+                )
+            else:
+                code.add_from_import(
+                    "drgn.helpers.linux.list", "validate_list_count_nodes"
+                )
+                code.append(
+                    "num_blocks = validate_list_count_nodes(free_list.address_of_())\n"
+                )
         code.append(
             """\
                 num_pages = num_blocks << order
@@ -1593,9 +1596,7 @@ def _kmem_identify(
             elif isinstance(identified, (IdentifiedTaskStruct, IdentifiedTaskStack)):
                 if mode is None:
                     print_divider()
-                    _SysPrinter(
-                        prog, False, system_fields=False, context=identified.task
-                    ).print()
+                    _print_sys(prog, system_fields=False, context=identified.task)
             elif isinstance(identified, IdentifiedVmap):
                 found_vmap = True
                 if mode is None or mode == "vmalloc":

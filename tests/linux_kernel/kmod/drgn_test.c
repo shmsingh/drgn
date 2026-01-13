@@ -10,6 +10,8 @@
 
 #include <linux/version.h>
 
+#include <linux/blkdev.h>
+#include <linux/blk-mq.h>
 #include <linux/completion.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
@@ -29,12 +31,15 @@
 #include <linux/mm.h>
 #include <linux/mmzone.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/nodemask.h>
 #include <linux/plist.h>
 #include <linux/radix-tree.h>
 #include <linux/rbtree.h>
 #include <linux/rbtree_augmented.h>
+#include <linux/rwsem.h>
+#include <linux/sbitmap.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/stacktrace.h>
@@ -46,6 +51,14 @@
 #include <linux/timer.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
+#include <linux/swait.h>
+
+// Before Linux kernel commit b3dae109fa89 ("sched/swait: Rename to exclusive")
+// (in v4.19), prepare_to_swait_exclusive() was named prepare_to_swait().
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
+#define prepare_to_swait_exclusive prepare_to_swait
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
 #define HAVE_XARRAY 1
 #include <linux/xarray.h>
@@ -190,31 +203,388 @@ static void drgn_test_constants_init(void)
 #endif
 }
 
+// block
+
+// blk_mode_t, BLK_OPEN_READ, and BLK_OPEN_WRITE were added in Linux kernel
+// commit 05bdb9965305 ("block: replace fmode_t with a block-specific type for
+// block open flags") (in v6.5).
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+#define blk_mode_t fmode_t
+#define BLK_OPEN_READ FMODE_READ
+#define BLK_OPEN_WRITE FMODE_WRITE
+#endif
+
+// blk_status_t and BLK_STS_OK were added in Linux kernel commit 2a842acab109
+// ("block: introduce new block status code type") (in v4.13).
+#ifndef BLK_STS_OK
+#define blk_status_t int
+#define BLK_STS_OK 0
+#endif
+
+// blk_mq_alloc_disk() was added in Linux kernel commit b461dfc49eb6 ("blk-mq:
+// add the blk_mq_alloc_disk APIs") (in v5.14).
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
+static struct gendisk *blk_mq_alloc_disk(struct blk_mq_tag_set *set, void *queuedata)
+{
+       struct request_queue *q;
+       struct gendisk *disk;
+
+       // Not blk_mq_init_queue_data() because that was added in Linux kernel
+       // commit 2f227bb99934 ("block: add a blk_mq_init_queue_data helper") (in
+       // v5.7).
+       q = blk_mq_init_queue(set);
+       if (IS_ERR(q))
+               return ERR_CAST(q);
+       q->queuedata = queuedata;
+
+       disk = alloc_disk_node(0, set->numa_node);
+       if (!disk) {
+               blk_cleanup_queue(q);
+               return ERR_PTR(-ENOMEM);
+       }
+       disk->queue = q;
+       return disk;
+}
+#endif
+
+static int drgn_test_blkdev_major;
+
+struct drgn_test_blkdev {
+	struct blk_mq_tag_set tag_set;
+	struct gendisk *disk;
+	spinlock_t lock;
+	int truant;
+	struct list_head loafing_requests;
+} drgn_test_blkdevs[2];
+
+static void drgn_test_blkdev_complete_rq(struct request *rq)
+{
+	struct bio *bio;
+
+	if (req_op(rq) == REQ_OP_READ) {
+		__rq_for_each_bio(bio, rq)
+			zero_fill_bio(bio);
+	}
+	blk_mq_end_request(rq, BLK_STS_OK);
+}
+
+static ssize_t drgn_test_blkdev_truant_show(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	struct drgn_test_blkdev *data = dev_to_disk(dev)->private_data;
+	return sprintf(buf, "%d\n", READ_ONCE(data->truant));
+}
+
+static ssize_t drgn_test_blkdev_truant_store(struct device *dev,
+					     struct device_attribute *attr,
+					     const char *buf, size_t count)
+{
+	struct drgn_test_blkdev *data = dev_to_disk(dev)->private_data;
+	LIST_HEAD(to_complete);
+	struct list_head *pos;
+	int ret, val;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+	if (val != 0 && val != 1)
+		return -EINVAL;
+
+	spin_lock(&data->lock);
+	if (!val)
+		list_splice_init(&data->loafing_requests, &to_complete);
+	data->truant = val;
+	spin_unlock(&data->lock);
+
+	list_for_each(pos, &to_complete)
+		drgn_test_blkdev_complete_rq(blk_mq_rq_from_pdu(pos));
+
+	return count;
+}
+
+static struct device_attribute drgn_test_blkdev_attr_truant =
+	__ATTR(truant, 0600, drgn_test_blkdev_truant_show,
+	       drgn_test_blkdev_truant_store);
+
+static const struct attribute_group drgn_test_blkdev_attr_group = {
+	.attrs = (struct attribute *[]){
+		&drgn_test_blkdev_attr_truant.attr,
+		NULL,
+	},
+};
+
+static const struct attribute_group *drgn_test_blkdev_attr_groups[] = {
+	&drgn_test_blkdev_attr_group,
+	NULL,
+};
+
+static blk_status_t drgn_test_queue_rq(struct blk_mq_hw_ctx *hctx,
+				       const struct blk_mq_queue_data *bd)
+{
+	struct request *rq = bd->rq;
+	struct drgn_test_blkdev *data = rq->q->queuedata;
+
+	blk_mq_start_request(rq);
+
+	spin_lock(&data->lock);
+	if (data->truant) {
+		list_add_tail(blk_mq_rq_to_pdu(rq), &data->loafing_requests);
+		spin_unlock(&data->lock);
+	} else {
+		spin_unlock(&data->lock);
+		drgn_test_blkdev_complete_rq(rq);
+	}
+
+	return BLK_STS_OK;
+}
+
+// For testing flush requests, we want an interface that synchronously queues a
+// flush request. Unfortunately, aio IOCB_CMD_FSYNC queues the request
+// asynchronously (with schedule_work()). Instead, we expose this via an ioctl.
+static int drgn_test_blkdev_ioctl(struct block_device *bdev, blk_mode_t mode,
+				  unsigned cmd, unsigned long arg)
+{
+	struct bio *bio;
+
+	// We co-opt the number for LOOP_SET_FD so that the test code doesn't
+	// need to worry about ioctl number encoding.
+	if (cmd != 0x4c00)
+		return -ENOTTY;
+
+	if (!(mode & (BLK_OPEN_READ | BLK_OPEN_WRITE)))
+		return -EBADF;
+
+	// The bdev and opf parameters to bio_alloc() were added in Linux kernel
+	// commit 07888c665b40 ("block: pass a block_device and opf to
+	// bio_alloc") (in v5.18). Before that, we have to set the block device
+	// and operation manually.
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+	bio = bio_alloc(bdev, 0, REQ_OP_WRITE | REQ_PREFLUSH, GFP_KERNEL);
+	if (!bio)
+		return -ENOMEM;
+#else
+	bio = bio_alloc(GFP_KERNEL, 0);
+	if (!bio)
+		return -ENOMEM;
+	// bio_set_dev() was added in Linux kernel commit 74d46992e0d9 ("block:
+	// replace bi_bdev with a gendisk pointer and partitions index") (in
+	// v4.14). Before that, we have to set bi_bdev manually.
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+	bio_set_dev(bio, bdev);
+#else
+	bio->bi_bdev = bdev;
+#endif
+	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
+#endif
+	bio->bi_end_io = bio_put;
+	submit_bio(bio);
+	// We shouldn't be poking at internals like this, but flush requests are
+	// added to the requeue list and queued asynchronously. We need them to
+	// be queued before we return.
+	flush_delayed_work(&bdev->bd_disk->queue->requeue_work);
+	return 0;
+}
+
+static const struct blk_mq_ops drgn_test_blk_mq_ops = {
+	.queue_rq = drgn_test_queue_rq,
+};
+
+static const struct block_device_operations drgn_test_blk_fops = {
+	.ioctl = drgn_test_blkdev_ioctl,
+	.owner = THIS_MODULE,
+};
+
+static int drgn_test_blkdev_create(struct drgn_test_blkdev *bdev,
+				   int index, int nr_hw_queues, int queue_depth,
+				   unsigned int tag_set_flags)
+{
+	int ret;
+
+	spin_lock_init(&bdev->lock);
+	INIT_LIST_HEAD(&bdev->loafing_requests);
+
+	// Before Linux kernel commit f8a5b12247fe ("blk-mq: make mq_ops a const
+	// pointer") (in v4.11), struct blk_mq_tag_set::ops wasn't marked const.
+	bdev->tag_set.ops =
+		(struct blk_mq_ops *)&drgn_test_blk_mq_ops;
+	bdev->tag_set.cmd_size = sizeof(struct list_head);
+	bdev->tag_set.nr_hw_queues = nr_hw_queues;
+	bdev->tag_set.queue_depth = queue_depth;
+	bdev->tag_set.numa_node = NUMA_NO_NODE;
+	bdev->tag_set.flags = tag_set_flags;
+	ret = blk_mq_alloc_tag_set(&bdev->tag_set);
+	if (ret) {
+		bdev->tag_set.ops = NULL;
+		return ret;
+	}
+
+	// We need write cache support to test flush requests.
+	// BLK_FEAT_WRITE_CACHE was added in Linux kernel commit 1122c0c1cc71
+	// ("block: move cache control settings out of queue->flags") (in
+	// v6.11). Before that, we have to call blk_queue_write_cache().
+	//
+	// The lim parameter was added to blk_mq_alloc_disk() in Linux kernel
+	// commit 27e32cd23fed ("block: pass a queue_limits argument to
+	// blk_mq_alloc_disk") (in v6.9).
+	bdev->disk = blk_mq_alloc_disk(&bdev->tag_set,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+				       (&(struct queue_limits){
+					       .features = BLK_FEAT_WRITE_CACHE,
+				       }),
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+				       NULL,
+#endif
+				       bdev);
+	if (IS_ERR(bdev->disk))
+		return PTR_ERR(bdev->disk);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+	blk_queue_write_cache(bdev->disk->queue, true, false);
+#endif
+	bdev->disk->major = drgn_test_blkdev_major;
+	bdev->disk->first_minor = index;
+	bdev->disk->minors = 1;
+	bdev->disk->fops = &drgn_test_blk_fops;
+	sprintf(bdev->disk->disk_name, "drgntestb%d", index);
+	set_capacity(bdev->disk, SZ_1G >> SECTOR_SHIFT);
+	bdev->disk->private_data = bdev;
+
+	// The groups parameter was added to device_add_disk() in Linux kernel
+	// commit fef912bf860e ("block: genhd: add 'groups' argument to
+	// device_add_disk") (in v4.20). Before that, we have to call
+	// sysfs_create_groups().
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
+	// Before Linux kernel commit 83cbce957446 ("block: add error handling
+	// for device_add_disk / add_disk") (in v5.15), device_add_disk() didn't
+	// return anything.
+	ret =
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+	0;
+#endif
+	device_add_disk(NULL, bdev->disk, drgn_test_blkdev_attr_groups);
+	if (ret)
+		return ret;
+#else
+	add_disk(bdev->disk);
+	ret = sysfs_create_groups(&disk_to_dev(bdev->disk)->kobj,
+				  drgn_test_blkdev_attr_groups);
+	if (ret)
+		return ret;
+#endif
+
+	return 0;
+}
+
+static void drgn_test_blkdev_destroy(struct drgn_test_blkdev *bdev)
+{
+	if (!IS_ERR_OR_NULL(bdev->disk))
+		put_disk(bdev->disk);
+	if (bdev->tag_set.ops)
+		blk_mq_free_tag_set(&bdev->tag_set);
+}
+
+static int drgn_test_block_init(void)
+{
+	int ret;
+
+	drgn_test_blkdev_major = register_blkdev(0, "drgntest");
+	if (drgn_test_blkdev_major < 0)
+		return drgn_test_blkdev_major;
+
+	ret = drgn_test_blkdev_create(&drgn_test_blkdevs[0], 0, 2, 2, 0);
+	if (ret)
+		return ret;
+	// BLK_MQ_F_TAG_HCTX_SHARED was added in Linux kernel commit
+	// 32bc15afed04 ("blk-mq: Facilitate a shared sbitmap per tagset") (in
+	// v5.10).
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	ret = drgn_test_blkdev_create(&drgn_test_blkdevs[1], 1, 2, 4,
+				      BLK_MQ_F_TAG_HCTX_SHARED);
+	if (ret)
+		return ret;
+#endif
+
+	return 0;
+}
+
+static void drgn_test_block_exit(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(drgn_test_blkdevs); i++)
+		drgn_test_blkdev_destroy(&drgn_test_blkdevs[i]);
+	if (drgn_test_blkdev_major > 0)
+		unregister_blkdev(drgn_test_blkdev_major, "drgntest");
+}
+
 // list
 
 LIST_HEAD(drgn_test_empty_list);
 LIST_HEAD(drgn_test_full_list);
 LIST_HEAD(drgn_test_singular_list);
 LIST_HEAD(drgn_test_corrupted_list);
+// Corrupted list where entry 1 points back to entry 0.
+LIST_HEAD(drgn_test_list_cycle1);
+// Corrupted list where entry 2 points back to entry 1.
+LIST_HEAD(drgn_test_list_cycle2);
+// Corrupted list where entry 3 points back to entry 2.
+LIST_HEAD(drgn_test_list_cycle3);
+// Corrupted list where entry 2 points to itself.
+LIST_HEAD(drgn_test_list_self_cycle);
+// Corrupted list where entry 0 points to NULL.
+LIST_HEAD(drgn_test_list_null);
 
 struct drgn_test_list_entry {
-	struct list_head node;
 	int value;
+	struct list_head node;
+};
+
+struct drgn_test_list_entry drgn_test_circular_list = {
+	.value = 1,
+	.node = LIST_HEAD_INIT(drgn_test_circular_list.node),
+};
+
+struct drgn_test_list_anchor {
+	long x, y;
+	struct list_head list;
+} drgn_test_anchored_list = {
+	.x = 101,
+	.y = 13,
+	.list = LIST_HEAD_INIT(drgn_test_anchored_list.list),
 };
 
 struct drgn_test_list_entry drgn_test_list_entries[3];
 struct drgn_test_list_entry drgn_test_singular_list_entry;
+struct drgn_test_list_entry drgn_test_circular_list_entries[2];
 struct drgn_test_list_entry drgn_test_corrupted_list_entries[2];
+struct drgn_test_list_entry drgn_test_list_cycle1_entries[2];
+struct drgn_test_list_entry drgn_test_list_cycle2_entries[3];
+struct drgn_test_list_entry drgn_test_list_cycle3_entries[4];
+struct drgn_test_list_entry drgn_test_list_self_cycle_entries[3];
+struct drgn_test_list_entry drgn_test_list_null_entry;
+struct drgn_test_list_entry drgn_test_anchored_list_entries[3];
 
 HLIST_HEAD(drgn_test_empty_hlist);
 HLIST_HEAD(drgn_test_full_hlist);
 
 struct drgn_test_hlist_entry {
-	struct hlist_node node;
 	int value;
+	struct hlist_node node;
 };
 
 struct drgn_test_hlist_entry drgn_test_hlist_entries[3];
+
+struct drgn_test_custom_list_entry {
+	int value;
+	struct drgn_test_custom_list_entry *next;
+};
+
+struct drgn_test_custom_list_entry drgn_test_custom_list;
+struct drgn_test_custom_list_entry drgn_test_custom_list_entries[2];
+// Custom list where entry 4 points back to entry 2.
+struct drgn_test_custom_list_entry drgn_test_custom_list_cycle[5];
+// Custom list where entry 2 points to itself.
+struct drgn_test_custom_list_entry drgn_test_custom_list_self_cycle[3];
 
 // Emulate a race condition between two threads calling list_add() at the same
 // time.
@@ -245,6 +615,7 @@ static void drgn_test_list_init(void)
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(drgn_test_list_entries); i++) {
+		drgn_test_list_entries[i].value = i + 1;
 		list_add_tail(&drgn_test_list_entries[i].node,
 			      &drgn_test_full_list);
 	}
@@ -255,7 +626,73 @@ static void drgn_test_list_init(void)
 			       &drgn_test_full_hlist);
 	}
 
+	for (i = 0; i < ARRAY_SIZE(drgn_test_circular_list_entries); i++) {
+		drgn_test_circular_list_entries[i].value = i + 2;
+		list_add_tail(&drgn_test_circular_list_entries[i].node,
+			      &drgn_test_circular_list.node);
+	}
+
 	init_corrupted_list();
+
+#define init_list_cycle(n)							\
+	do {									\
+		for (i = 0; i < ARRAY_SIZE(drgn_test_list_cycle##n##_entries); i++) {\
+			list_add_tail(&drgn_test_list_cycle##n##_entries[i].node,\
+				      &drgn_test_list_cycle##n);		\
+		}								\
+		drgn_test_list_cycle##n##_entries[ARRAY_SIZE(drgn_test_list_cycle##n##_entries) - 1].node.next =\
+			&drgn_test_list_cycle##n##_entries[ARRAY_SIZE(drgn_test_list_cycle##n##_entries) - 2].node;\
+		drgn_test_list_cycle##n##_entries[ARRAY_SIZE(drgn_test_list_cycle##n##_entries) - 2].node.prev =\
+			&drgn_test_list_cycle##n##_entries[ARRAY_SIZE(drgn_test_list_cycle##n##_entries) - 1].node;\
+	} while (0)
+
+	init_list_cycle(1);
+	init_list_cycle(2);
+	init_list_cycle(3);
+#undef init_list_cycle
+
+	for (i = 0; i < ARRAY_SIZE(drgn_test_list_self_cycle_entries); i++) {
+		list_add_tail(&drgn_test_list_self_cycle_entries[i].node,
+			      &drgn_test_list_self_cycle);
+	}
+	INIT_LIST_HEAD(&drgn_test_list_self_cycle_entries[ARRAY_SIZE(drgn_test_list_self_cycle_entries) - 1].node);
+
+	list_add_tail(&drgn_test_list_null_entry.node, &drgn_test_list_null);
+	drgn_test_list_null_entry.node.next = NULL;
+
+	for (i = 0; i < ARRAY_SIZE(drgn_test_anchored_list_entries); i++) {
+		drgn_test_anchored_list_entries[i].value = i + 1;
+		list_add_tail(&drgn_test_anchored_list_entries[i].node,
+			      &drgn_test_anchored_list.list);
+	}
+
+	drgn_test_custom_list.value = 1;
+	for (i = 0; i < ARRAY_SIZE(drgn_test_custom_list_entries); i++) {
+		drgn_test_custom_list_entries[i].value = i + 2;
+		if (i == 0) {
+			drgn_test_custom_list.next = &drgn_test_custom_list_entries[i];
+		} else {
+			drgn_test_custom_list_entries[i - 1].next =
+				&drgn_test_custom_list_entries[i];
+		}
+	}
+
+	drgn_test_custom_list_cycle[0].value = 1;
+	for (i = 1; i < ARRAY_SIZE(drgn_test_custom_list_cycle); i++) {
+		drgn_test_custom_list_cycle[i].value = i + 1;
+		drgn_test_custom_list_cycle[i - 1].next =
+			&drgn_test_custom_list_cycle[i];
+	}
+	drgn_test_custom_list_cycle[4].next = &drgn_test_custom_list_cycle[2];
+
+	drgn_test_custom_list_self_cycle[0].value = 1;
+	for (i = 1; i < ARRAY_SIZE(drgn_test_custom_list_self_cycle); i++) {
+		drgn_test_custom_list_self_cycle[i].value = i + 1;
+		drgn_test_custom_list_self_cycle[i - 1].next =
+			&drgn_test_custom_list_self_cycle[i];
+	}
+	drgn_test_custom_list_self_cycle[2].next =
+		&drgn_test_custom_list_self_cycle[2];
 }
 
 // llist
@@ -265,8 +702,8 @@ LLIST_HEAD(drgn_test_full_llist);
 LLIST_HEAD(drgn_test_singular_llist);
 
 struct drgn_test_llist_entry {
-	struct llist_node node;
 	int value;
+	struct llist_node node;
 };
 
 struct drgn_test_llist_entry drgn_test_llist_entries[3];
@@ -292,8 +729,8 @@ struct plist_node drgn_test_empty_plist_node =
 	PLIST_NODE_INIT(drgn_test_empty_plist_node, 50);
 
 struct drgn_test_plist_entry {
-	struct plist_node node;
 	char c;
+	struct plist_node node;
 };
 
 struct drgn_test_plist_entry drgn_test_plist_entries[3];
@@ -341,6 +778,99 @@ static void drgn_test_plist_init(void)
 	drgn_plist_add(&drgn_test_plist_entries[1].node, &drgn_test_full_plist);
 	drgn_plist_add(&drgn_test_plist_entries[0].node, &drgn_test_full_plist);
 	drgn_plist_add(&drgn_test_plist_entries[2].node, &drgn_test_full_plist);
+}
+
+// locking
+
+static DECLARE_COMPLETION(drgn_test_locking_kthread_ready);
+struct task_struct *drgn_test_locking_kthread;
+struct task_struct *drgn_test_locking_kthread2;
+DEFINE_MUTEX(drgn_test_mutex_locked);
+DEFINE_MUTEX(drgn_test_mutex_unlocked);
+DECLARE_RWSEM(drgn_test_rwsem_read_locked);
+DECLARE_RWSEM(drgn_test_rwsem_write_locked);
+DECLARE_RWSEM(drgn_test_rwsem_previously_read_locked);
+DECLARE_RWSEM(drgn_test_rwsem_previously_write_locked);
+DECLARE_RWSEM(drgn_test_rwsem_never_locked);
+DECLARE_RWSEM(drgn_test_rwsem_writer_waiting);
+
+static int drgn_test_locking_kthread_fn(void *arg)
+{
+	mutex_lock(&drgn_test_mutex_locked);
+
+	down_read(&drgn_test_rwsem_read_locked);
+	down_write(&drgn_test_rwsem_write_locked);
+
+	down_read(&drgn_test_rwsem_previously_read_locked);
+	up_read(&drgn_test_rwsem_previously_read_locked);
+
+	down_write(&drgn_test_rwsem_previously_write_locked);
+	up_write(&drgn_test_rwsem_previously_write_locked);
+
+	down_read(&drgn_test_rwsem_writer_waiting);
+
+	complete(&drgn_test_locking_kthread_ready);
+	for (;;) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (kthread_should_stop()) {
+			__set_current_state(TASK_RUNNING);
+			break;
+		}
+		if (kthread_should_park()) {
+			__set_current_state(TASK_RUNNING);
+			kthread_parkme();
+			continue;
+		}
+		schedule();
+		__set_current_state(TASK_RUNNING);
+	}
+
+	up_read(&drgn_test_rwsem_writer_waiting);
+	up_write(&drgn_test_rwsem_write_locked);
+	up_read(&drgn_test_rwsem_read_locked);
+
+	mutex_unlock(&drgn_test_mutex_locked);
+	return 0;
+}
+
+static int drgn_test_locking_kthread_fn2(void *arg)
+{
+	down_write(&drgn_test_rwsem_writer_waiting);
+	up_write(&drgn_test_rwsem_writer_waiting);
+	return 0;
+}
+
+static int drgn_test_locking_init(void)
+{
+	drgn_test_locking_kthread = kthread_create(drgn_test_locking_kthread_fn,
+						   NULL,
+						   "drgn_test_locking_kthread");
+	if (!drgn_test_locking_kthread)
+		return -1;
+	wake_up_process(drgn_test_locking_kthread);
+	wait_for_completion(&drgn_test_locking_kthread_ready);
+
+	drgn_test_locking_kthread2 =
+		kthread_create(drgn_test_locking_kthread_fn2, NULL,
+			       "drgn_test_locking_kthread2");
+	if (!drgn_test_locking_kthread2)
+		return -1;
+	wake_up_process(drgn_test_locking_kthread2);
+
+	return kthread_park(drgn_test_locking_kthread);
+}
+
+static void drgn_test_locking_exit(void)
+{
+	// This one needs to exit first to unblock the second one.
+	if (drgn_test_locking_kthread) {
+		kthread_stop(drgn_test_locking_kthread);
+		drgn_test_locking_kthread = NULL;
+	}
+	if (drgn_test_locking_kthread2) {
+		kthread_stop(drgn_test_locking_kthread2);
+		drgn_test_locking_kthread2 = NULL;
+	}
 }
 
 // mapletree
@@ -953,6 +1483,55 @@ static void drgn_test_rbtree_init(void)
 		     &drgn_test_rb_entries_with_black_violation[0].node,
 		     &drgn_test_rb_entries_with_black_violation[0].node.rb_right);
 	drgn_test_rb_entries_with_black_violation[1].node.__rb_parent_color |= RB_BLACK;
+}
+
+// sbitmap
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+// sbitmap_deferred_clear_bit() was added in Linux kernel commit ea86ea2cdced
+// ("sbitmap: ammortize cost of clearing bits") (in v5.0).
+#define sbitmap_deferred_clear_bit sbitmap_clear_bit
+#endif
+
+struct sbitmap drgn_test_sbitmap;
+
+static int drgn_test_sbitmap_init(void)
+{
+	int ret;
+
+	ret = sbitmap_init_node(&drgn_test_sbitmap, 128, 4, GFP_KERNEL,
+				NUMA_NO_NODE
+// The round_robin and alloc_hint parameters were added in Linux kernel commits
+// efe1f3a1d583 ("scsi: sbitmap: Maintain allocation round_robin in sbitmap"),
+// and c548e62bcf6a ("scsi: sbitmap: Move allocation hint into sbitmap") (both
+// in v5.13), respectively.
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+				, false , false
+#endif
+				);
+	if (ret)
+		return ret;
+
+	sbitmap_set_bit(&drgn_test_sbitmap, 13);
+	sbitmap_set_bit(&drgn_test_sbitmap, 23);
+	sbitmap_set_bit(&drgn_test_sbitmap, 24);
+	sbitmap_set_bit(&drgn_test_sbitmap, 97);
+	sbitmap_set_bit(&drgn_test_sbitmap, 98);
+	sbitmap_set_bit(&drgn_test_sbitmap, 99);
+	sbitmap_set_bit(&drgn_test_sbitmap, 123);
+
+	sbitmap_clear_bit(&drgn_test_sbitmap, 97);
+	// Resize to smaller than a set bit to test that the depth is enforced
+	// properly.
+	sbitmap_resize(&drgn_test_sbitmap, 100);
+	sbitmap_deferred_clear_bit(&drgn_test_sbitmap, 98);
+	return 0;
+}
+
+static void drgn_test_sbitmap_exit(void)
+{
+	if (drgn_test_sbitmap.map)
+		sbitmap_free(&drgn_test_sbitmap);
 }
 
 // slab
@@ -1687,6 +2266,81 @@ static void drgn_test_waitq_exit(void)
 	}
 }
 
+// simple-wait-queue
+static struct task_struct *drgn_test_swaitq_kthread;
+static struct swait_queue_head drgn_test_swaitq;
+static struct swait_queue_head drgn_test_empty_swaitq;
+
+static int drgn_test_swaitq_kthread_fn(void *arg)
+{
+	DECLARE_SWAITQUEUE(swait);
+	for (;;) {
+		prepare_to_swait_exclusive(&drgn_test_swaitq, &swait, TASK_UNINTERRUPTIBLE);
+		if (kthread_should_stop())
+			break;
+		schedule();
+	}
+	finish_swait(&drgn_test_swaitq, &swait);
+	return 0;
+}
+
+static int drgn_test_swaitq_init(void)
+{
+	init_swait_queue_head(&drgn_test_swaitq);
+	init_swait_queue_head(&drgn_test_empty_swaitq);
+
+	drgn_test_swaitq_kthread = kthread_create(drgn_test_swaitq_kthread_fn,
+						 NULL,
+						 "drgn_test_swaitq_kthread");
+	if (!drgn_test_swaitq_kthread)
+		return -1;
+
+	wake_up_process(drgn_test_swaitq_kthread);
+	return 0;
+}
+
+static void drgn_test_swaitq_exit(void)
+{
+	if (drgn_test_swaitq_kthread) {
+		kthread_stop(drgn_test_swaitq_kthread);
+		drgn_test_swaitq_kthread = NULL;
+	}
+}
+
+// completion variable
+static struct task_struct *drgn_test_completion_kthread;
+static struct completion drgn_test_completion;
+static struct completion drgn_test_done_completion;
+
+static int drgn_test_completion_kthread_fn(void *arg)
+{
+	complete(&drgn_test_done_completion);
+	wait_for_completion(&drgn_test_completion);
+	return 0;
+}
+
+static int drgn_test_completion_init(void)
+{
+	drgn_test_completion_kthread = kthread_create(drgn_test_completion_kthread_fn,
+						 NULL,
+						 "drgn_test_completion_kthread");
+	if (!drgn_test_completion_kthread)
+		return -1;
+
+	init_completion(&drgn_test_completion);
+	init_completion(&drgn_test_done_completion);
+	wake_up_process(drgn_test_completion_kthread);
+	return 0;
+}
+
+static void drgn_test_completion_exit(void)
+{
+	if (drgn_test_completion_kthread) {
+		complete(&drgn_test_completion);
+		drgn_test_completion_kthread = NULL;
+	}
+}
+
 // Dummy function symbol.
 int drgn_test_function(int x); // Silence -Wmissing-prototypes.
 int drgn_test_function(int x)
@@ -2049,6 +2703,7 @@ static void drgn_test_exit(void)
 {
 	drgn_test_sysfs_exit();
 	drgn_test_slab_exit();
+	drgn_test_sbitmap_exit();
 	drgn_test_percpu_exit();
 	drgn_test_maple_tree_exit();
 	drgn_test_mm_exit();
@@ -2059,7 +2714,11 @@ static void drgn_test_exit(void)
 	drgn_test_radix_tree_exit();
 	drgn_test_xarray_exit();
 	drgn_test_waitq_exit();
+	drgn_test_locking_exit();
 	drgn_test_idr_exit();
+	drgn_test_block_exit();
+	drgn_test_swaitq_exit();
+	drgn_test_completion_exit();
 }
 
 static int __init drgn_test_init(void)
@@ -2067,9 +2726,15 @@ static int __init drgn_test_init(void)
 	int ret;
 
 	drgn_test_constants_init();
+	ret = drgn_test_block_init();
+	if (ret)
+		goto out;
 	drgn_test_list_init();
 	drgn_test_llist_init();
 	drgn_test_plist_init();
+	ret = drgn_test_locking_init();
+	if (ret)
+		goto out;
 	ret = drgn_test_maple_tree_init();
 	if (ret)
 		goto out;
@@ -2087,6 +2752,9 @@ static int __init drgn_test_init(void)
 	if (ret)
 		goto out;
 	drgn_test_rbtree_init();
+	ret = drgn_test_sbitmap_init();
+	if (ret)
+		goto out;
 	ret = drgn_test_slab_init();
 	if (ret)
 		goto out;
@@ -2112,6 +2780,14 @@ static int __init drgn_test_init(void)
 	if (ret)
 		goto out;
 	ret = drgn_test_crash_init();
+	if (ret)
+		goto out;
+
+	ret = drgn_test_swaitq_init();
+	if (ret)
+		goto out;
+
+	ret = drgn_test_completion_init();
 out:
 	if (ret)
 		drgn_test_exit();

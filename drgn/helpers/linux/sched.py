@@ -34,6 +34,7 @@ __all__ = (
     "task_since_last_arrival_ns",
     "task_state_to_char",
     "task_thread_info",
+    "thread_group_leader",
 )
 
 _TASK_NOLOAD = 0x400
@@ -115,7 +116,7 @@ def task_state_to_char(task: Object) -> str:
             task_state_name,
         )
     else:
-        task_state = getattr(task, task_state_name)
+        task_state = task.member_(task_state_name)
     task_state = task_state.value_()
     exit_state = task.exit_state.value_()
     state = (task_state | exit_state) & TASK_REPORT
@@ -209,3 +210,12 @@ def task_since_last_arrival_ns(task: Object) -> int:
     rq_clock = task_rq(task).clock.value_()
 
     return rq_clock - arrival_time
+
+
+def thread_group_leader(task: Object) -> bool:
+    """
+    Return whether a task is a thread group leader.
+
+    :param task: ``struct task_struct *``
+    """
+    return task.exit_signal >= 0

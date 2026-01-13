@@ -13,15 +13,20 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import dataclasses
+import functools
 import re
 import subprocess
 import sys
 import textwrap
+import traceback
+import types
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     Dict,
+    Generic,
     Iterable,
     Iterator,
     List,
@@ -33,20 +38,26 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    TypeVar,
     Union,
     overload,
 )
 
 if TYPE_CHECKING:
     if sys.version_info < (3, 11):
-        from typing_extensions import assert_never
+        from typing_extensions import Self, assert_never
     else:
-        from typing import assert_never  # novermin
+        from typing import Self, assert_never  # novermin
     from _typeshed import SupportsWrite
 
 import _drgn_util.argparseformatter
 from _drgn_util.typingutils import copy_method_params
 from drgn import Program, ProgramFlags
+
+T = TypeVar("T")
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
 
 _WORD_CHARACTER = r"""[^\s"#&'();<>\\`|]"""
 _WORD_CHARACTER_OR_HASH = _WORD_CHARACTER.replace("#", "")
@@ -73,88 +84,10 @@ _SHELL_TOKEN_REGEX = re.compile(
 )
 
 
-def _unquote_repl(match: "re.Match[str]") -> str:
-    s = match.group()
-    if s[0] == "\\":
-        return s[1]
-    elif s[0] == '"':
-        return re.sub(r'\\([$`"\\\n])', r"\1", s[1:-1])
-    else:
-        assert s[0] == "'"
-        return s[1:-1]
-
-
-def _unquote(s: str) -> str:
-    return re.sub(_ESCAPED_OR_QUOTED_WORD, _unquote_repl, s)
-
-
-_RedirectOp = Literal["<", ">", ">>"]
-
-
-class _ShellRedirection(NamedTuple):
-    fd: int
-    op: _RedirectOp
-    path: str
-
-
-class _ParsedShellCommand(NamedTuple):
-    args: Sequence[str]
-    redirections: Sequence[_ShellRedirection]
-    pipeline: Optional[str]
-
-
-def _parse_shell_command(source: str) -> _ParsedShellCommand:
-    args: List[str] = []
-    redirections: List[_ShellRedirection] = []
-    pipeline = None
-    redirection = None
-
-    for match in _SHELL_TOKEN_REGEX.finditer(source):
-        kind = match.lastgroup
-        value = match.group()
-        if kind == "WORD":
-            value = _unquote(value)
-            if redirection is None:
-                args.append(value)
-            else:
-                redirections.append(
-                    _ShellRedirection(fd=redirection[0], op=redirection[1], path=value)
-                )
-                redirection = None
-        elif kind == "PIPELINE":
-            # NB: since this is called with the substring after the command
-            # name, unlike sh, we allow a string starting with '|'.
-            if redirection is not None:
-                raise SyntaxError("unexpected '|'")
-            pipeline = value[1:].strip()
-            if not pipeline:
-                raise SyntaxError("unexpected end of input")
-        elif kind == "REDIRECT":
-            if redirection is not None:
-                raise SyntaxError(f"unexpected {value!r}")
-            redirect_op: _RedirectOp = match.group("redirect_op")  # type: ignore[assignment]
-            if match.group("redirect_fd"):
-                redirect_fd = int(match.group("redirect_fd"))
-            elif redirect_op == "<":
-                redirect_fd = 0
-            elif redirect_op == ">" or redirect_op == ">>":
-                redirect_fd = 1
-            else:
-                assert_never(redirect_op)
-            redirection = (redirect_fd, redirect_op)
-        elif kind in ("WHITESPACE", "COMMENT"):
-            pass
-        else:
-            raise SyntaxError(f"unexpected {value!r}")
-    if redirection is not None:
-        raise SyntaxError("unexpected end of input")
-    return _ParsedShellCommand(args, redirections, pipeline)
-
-
 @contextlib.contextmanager
-def _shell_command(source: str) -> Iterator[_ParsedShellCommand]:
-    parsed = _parse_shell_command(source)
-
+def _redirect_and_pipe(
+    redirections: Sequence[ShellRedirection], pipeline: Optional[str]
+) -> Iterator[None]:
     saved = {
         "stdin": sys.stdin,
         "stdout": sys.stdout,
@@ -163,9 +96,9 @@ def _shell_command(source: str) -> Iterator[_ParsedShellCommand]:
     pipe_process = None
     exceptions = []
     try:
-        if parsed.pipeline is not None:
+        if pipeline is not None:
             pipe_process = subprocess.Popen(
-                parsed.pipeline,
+                pipeline,
                 shell=True,
                 stdin=subprocess.PIPE,
                 stdout=sys.stdout,
@@ -173,7 +106,7 @@ def _shell_command(source: str) -> Iterator[_ParsedShellCommand]:
             )
             sys.stdout = pipe_process.stdin
 
-        for fd, op, path in parsed.redirections:
+        for fd, op, path in redirections:
             if op == "<":
                 if fd != 0:
                     raise NotImplementedError(
@@ -206,7 +139,7 @@ def _shell_command(source: str) -> Iterator[_ParsedShellCommand]:
             setattr(sys, attr, open(path, mode))
 
         try:
-            yield parsed
+            yield
         except BrokenPipeError:
             pass
     except Exception as e:
@@ -342,21 +275,22 @@ class CommandNamespace:
         Create a command namespace.
 
         :param func_name_prefix: Function name prefix expected by
-            :func:`command()` and :func:`custom_command()`.
+            :func:`command()`, :func:`custom_command()`, and
+            :func:`raw_command()`.
         :param argparse_types: ``(name, callable)`` tuples to register as
             argparse types for commands in this namespace. See
             :meth:`argparse.ArgumentParser.register()`.
         """
 
-        self._commands: Dict[str, Command] = {}
+        self._commands: Dict[str, Command[object]] = {}
         self._func_name_prefix = func_name_prefix
         self._argparse_types = argparse_types
 
-    def register(self, name: str, command: Command) -> None:
+    def register(self, name: str, command: Command[Any]) -> None:
         """Register a command in this namespace."""
         self._commands[name] = command
 
-    def lookup(self, prog: Program, name: str) -> Command:
+    def lookup(self, prog: Program, name: str) -> Command[object]:
         """
         Find a command in this namespace.
 
@@ -368,7 +302,7 @@ class CommandNamespace:
             raise CommandNotFoundError(name)
         return command
 
-    def enabled(self, prog: Program) -> Iterable[Tuple[str, Command]]:
+    def enabled(self, prog: Program) -> Iterable[Tuple[str, Command[object]]]:
         """
         Get all enabled commands in this namespace.
 
@@ -378,18 +312,6 @@ class CommandNamespace:
             (name, command)
             for name, command in self._commands.items()
             if command.enabled(prog)
-        )
-
-    def _run(self, prog: Program, command: str, *, globals: Dict[str, Any]) -> Any:
-        command = command.lstrip()
-        match = _SHELL_TOKEN_REGEX.match(command)
-        if not match or match.lastgroup != "WORD":
-            raise SyntaxError("expected command name")
-
-        command_name = _unquote(match.group())
-        args = command[match.end() :].lstrip()
-        return self.lookup(prog, command_name).run(
-            prog, command_name, args, globals=globals
         )
 
     def run(
@@ -409,7 +331,26 @@ class CommandNamespace:
             globals = sys._getframe(1).f_globals
 
         try:
-            return self._run(prog, command, globals=globals)
+            kwargs = {"globals": globals}
+            name, tail, command_obj, pager = self._resolve(prog, command, kwargs)
+            parsed = command_obj.parse(tail)
+
+            pipeline = parsed.pipeline
+            if (
+                pipeline is None
+                and not any(redirection.fd == 1 for redirection in parsed.redirections)
+                and pager is not None
+            ):
+                # We can only pipe to a pager if stdout is a file descriptor.
+                try:
+                    sys.stdout.fileno()
+                except (AttributeError, OSError):
+                    pass
+                else:
+                    pipeline = pager
+
+            with _redirect_and_pipe(parsed.redirections, pipeline):
+                return command_obj.run(prog, name, parsed.args, **kwargs)
         except Exception as e:
             if onerror is None:
                 raise
@@ -421,18 +362,29 @@ class CommandNamespace:
             else:
                 onerror(e)
 
+    def _resolve(
+        self, prog: Program, command: str, kwargs: Dict[str, Any]
+    ) -> Tuple[str, str, Command[object], Optional[str]]:
+        command = command.lstrip()
+        match = _SHELL_TOKEN_REGEX.match(command)
+        if not match or match.lastgroup != "WORD":
+            raise SyntaxError("expected command name")
+
+        name = unquote_shell_word(match.group())
+        return name, command[match.end() :].lstrip(), self.lookup(prog, name), None
+
 
 DEFAULT_COMMAND_NAMESPACE: CommandNamespace = CommandNamespace()
 """Default command namespace used by the drgn CLI."""
 
 
-class Command(Protocol):
+class Command(Protocol[T]):
     """
     Command implementation.
 
-    Commands can usually be defined with :func:`command()` or
-    :func:`custom_command()`, but this can be used when even more control is
-    needed.
+    Commands can usually be defined with :func:`command()`,
+    :func:`custom_command()`, or :func:`raw_command()`, but this can be used
+    when even more control is needed.
     """
 
     def description(self) -> str:
@@ -457,11 +409,22 @@ class Command(Protocol):
         """
         ...
 
+    def parse(self, source: str, /) -> ParsedCommand[T]:
+        """
+        Parse the command string after the command name.
+
+        This must separate redirections and pipes from arguments.
+
+        :param source: Command string after command name (arguments,
+            redirections, pipes, etc.).
+        """
+        ...
+
     def run(
         self,
         prog: Program,
         name: str,
-        args: str,
+        args: T,
         /,
         *,
         globals: Dict[str, Any],
@@ -471,7 +434,8 @@ class Command(Protocol):
 
         :param prog: Program.
         :param name: Name that the command was invoked as.
-        :param args: Command arguments as a string.
+        :param args: Command arguments returned in :attr:`ParsedCommand.args`
+            by :meth:`parse()`.
 
         Additional keyword arguments may also be passed. To allow for future
         extensions, implementations of this method should add a variable
@@ -482,7 +446,9 @@ class Command(Protocol):
 
             class MyCommand:
                 ...
-                def run(self, prog: Program, name: str, args: str, **kwargs: Any) -> None:
+                def run(
+                    self, prog: Program, name: str, args: Sequence[str], **kwargs: Any
+                ) -> None:
                     ...
 
         The current keyword parameters are:
@@ -492,6 +458,119 @@ class Command(Protocol):
         :return: Anything, but usually ``None``.
         """
         ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ParsedCommand(Generic[T]):
+    """Parsed command string."""
+
+    args: T
+    """Arguments."""
+
+    redirections: Sequence[ShellRedirection] = ()
+    """Shell redirections."""
+
+    pipeline: Optional[str] = None
+    """Pipeline."""
+
+
+class ShellRedirection(NamedTuple):
+    """Shell redirection."""
+
+    fd: int
+    """File descriptor to redirect."""
+
+    op: RedirectOp
+    """Redirection operator (``"<"``, ``">"``, etc.)."""
+
+    path: str
+    """Path to redirect to."""
+
+
+RedirectOp = Literal["<", ">", ">>"]
+
+
+def parse_shell_command(
+    source: str, unquote: bool = True
+) -> ParsedCommand[Sequence[str]]:
+    """
+    Parse a shell command string.
+
+    :param source: Command string after command name (arguments,
+        redirections, pipes, etc.).
+    :param unquote: Whether to unquote/unescape arguments.
+    """
+    args: List[str] = []
+    redirections: List[ShellRedirection] = []
+    pipeline = None
+    redirection = None
+
+    for match in _SHELL_TOKEN_REGEX.finditer(source):
+        kind = match.lastgroup
+        value = match.group()
+        if kind == "WORD":
+            if redirection is None:
+                if unquote:
+                    value = unquote_shell_word(value)
+                args.append(value)
+            else:
+                redirections.append(
+                    ShellRedirection(
+                        fd=redirection[0],
+                        op=redirection[1],
+                        path=unquote_shell_word(value),
+                    )
+                )
+                redirection = None
+        elif kind == "PIPELINE":
+            # NB: since this is called with the substring after the command
+            # name, unlike sh, we allow a string starting with '|'.
+            if redirection is not None:
+                raise SyntaxError("unexpected '|'")
+            pipeline = value[1:].strip()
+            if not pipeline:
+                raise SyntaxError("unexpected end of input")
+        elif kind == "REDIRECT":
+            if redirection is not None:
+                raise SyntaxError(f"unexpected {value!r}")
+            redirect_op: RedirectOp = match.group("redirect_op")  # type: ignore[assignment]
+            if match.group("redirect_fd"):
+                redirect_fd = int(match.group("redirect_fd"))
+            elif redirect_op == "<":
+                redirect_fd = 0
+            elif redirect_op == ">" or redirect_op == ">>":
+                redirect_fd = 1
+            else:
+                assert_never(redirect_op)
+            redirection = (redirect_fd, redirect_op)
+        elif kind in ("WHITESPACE", "COMMENT"):
+            pass
+        else:
+            raise SyntaxError(f"unexpected {value!r}")
+    if redirection is not None:
+        raise SyntaxError("unexpected end of input")
+    return ParsedCommand(args, redirections, pipeline)
+
+
+def _unquote_repl(match: "re.Match[str]") -> str:
+    s = match.group()
+    if s[0] == "\\":
+        return s[1]
+    elif s[0] == '"':
+        return re.sub(r'\\([$`"\\\n])', r"\1", s[1:-1])
+    else:
+        assert s[0] == "'"
+        return s[1:-1]
+
+
+def unquote_shell_word(word: str) -> str:
+    r"""
+    Unquote/unescape a quoted and/or escaped word in shell syntax.
+
+    >>> print(unquote_shell_word(r"f'o'o\ bar"))
+    foo bar
+    """
+    return re.sub(_ESCAPED_OR_QUOTED_WORD, _unquote_repl, word)
 
 
 @overload
@@ -538,15 +617,17 @@ def _add_argument(
 
 
 def _command_name(
-    name: Optional[str], func: Callable[..., Any], namespace: CommandNamespace
+    name: Optional[str],
+    func: Callable[..., Any],
+    prefix: str,
 ) -> str:
     if name is None:
         if not hasattr(func, "__name__"):
             raise ValueError("callable doesn't have __name__; pass name explicitly")
-        match = re.fullmatch(namespace._func_name_prefix + r"(\w+)", func.__name__)
+        match = re.fullmatch(prefix + r"(\w+)", func.__name__)
         if not match:
             raise ValueError(
-                f"{func.__name__!r} doesn't start with {namespace._func_name_prefix}; "
+                f"{func.__name__!r} doesn't start with {prefix}; "
                 "rename it or pass name explicitly"
             )
         name = match.group(1)
@@ -564,9 +645,9 @@ def _decimal_or_hexadecimal(s: str) -> int:
 def _create_parser(
     *,
     name: str,
-    usage: Optional[str],
-    description: Optional[str],
-    epilog: Optional[str],
+    usage: Optional[str] = None,
+    description: Optional[str] = None,
+    epilog: Optional[str] = None,
     arguments: Sequence[Union[argument, argument_group, mutually_exclusive_group]],
     types: Sequence[Tuple[str, Callable[[str], Any]]],
 ) -> argparse.ArgumentParser:
@@ -588,6 +669,10 @@ def _create_parser(
     return parser
 
 
+def _always_enabled(prog: Program) -> bool:
+    return True
+
+
 def command(
     *,
     name: Optional[str] = None,
@@ -596,15 +681,15 @@ def command(
     long_description: Optional[str] = None,
     epilog: Optional[str] = None,
     arguments: Sequence[Union[argument, argument_group, mutually_exclusive_group]] = (),
-    enabled: Optional[Callable[[Program], bool]] = None,
+    enabled: Callable[[Program], bool] = _always_enabled,
     namespace: CommandNamespace = DEFAULT_COMMAND_NAMESPACE,
 ) -> CommandFuncDecorator:
     """
     Decorator to register a command.
 
     Commands registered with this decorator parse options specified in
-    *arguments* using :mod:`argparse`. See :func:`custom_command()` for an
-    alternative that doesn't use :mod:`argparse`.
+    *arguments* using :mod:`argparse`. See :func:`custom_command()` and
+    :func:`raw_command()` for alternatives that doesn't use :mod:`argparse`.
 
     See :class:`CommandFunc` for the signature of the command function.
 
@@ -649,7 +734,7 @@ def command(
     """
 
     def decorator(func: CommandFunc) -> CommandFunc:
-        command_name = _command_name(name, func, namespace)
+        command_name = _command_name(name, func, namespace._func_name_prefix)
 
         parser = _create_parser(
             name=command_name,
@@ -915,9 +1000,10 @@ def custom_command(
     arguments: Optional[
         Sequence[Union[argument, argument_group, mutually_exclusive_group]]
     ] = None,
-    enabled: Optional[Callable[[Program], bool]] = None,
+    parse: Callable[[str], ParsedCommand[T]],
+    enabled: Callable[[Program], bool] = _always_enabled,
     namespace: CommandNamespace = DEFAULT_COMMAND_NAMESPACE,
-) -> CustomCommandFuncDecorator:
+) -> CustomCommandFuncDecorator[T]:
     """
     Decorator to register a command with its own custom syntax (instead of
     command line options).
@@ -927,10 +1013,20 @@ def custom_command(
     .. code-block:: python3
 
         import ast
+        import dataclasses
+        import re
         from typing import Any
 
         from drgn import Program
-        from drgn.commands import custom_command
+        from drgn.commands import ParsedCommand, custom_command, parse_shell_command
+
+
+        def _parse_literal_eval(source: str) -> ParsedCommand[str]:
+            match = re.fullmatch(r"([^<>|]*)(.*)", source)
+            parsed = parse_shell_command(match.group(2))
+            if parsed.args:
+                raise SyntaxError("arguments after redirections are not supported")
+            return dataclasses.replace(parsed, args=match.group(1))
 
 
         @custom_command(
@@ -938,6 +1034,7 @@ def custom_command(
             usage="**literal_eval** *EXPR*",
             long_description="This evaluates and returns a Python literal"
             " (for example, a string, integer, list, etc.).",
+            parse=_parse_literal_eval,
         )
         def _cmd_literal_eval(
             prog: Program, name: str, args: str, **kwargs: Any
@@ -957,6 +1054,8 @@ def custom_command(
         output.
     :param arguments: Arguments, argument groups, and mutually exclusive groups
         accepted by the command. Used **only** for generating help output.
+    :param parse: Callback to parse the command string after the command name.
+        This must separate redirections and pipes from arguments.
     :param enabled: Callback returning whether the command should be enabled
         for a given program. Defaults to always enabled.
     :param namespace: Namespace to register command to.
@@ -969,8 +1068,8 @@ def custom_command(
             raise TypeError("long_description is mandatory if arguments not given")
         arguments = ()
 
-    def decorator(func: CustomCommandFunc) -> CustomCommandFunc:
-        command_name = _command_name(name, func, namespace)
+    def decorator(func: CustomCommandFunc[Any]) -> CustomCommandFunc[Any]:
+        command_name = _command_name(name, func, namespace._func_name_prefix)
 
         parser = _create_parser(
             name=command_name,
@@ -984,7 +1083,11 @@ def custom_command(
         namespace.register(
             command_name,
             _CustomCommand(
-                func=func, parser=parser, description=description, enabled=enabled
+                func=func,
+                parser=parser,
+                description=description,
+                parse=parse,
+                enabled=enabled,
             ),
         )
 
@@ -993,14 +1096,14 @@ def custom_command(
     return decorator
 
 
-class CustomCommandFunc(Protocol):
+class CustomCommandFunc(Protocol[T_contra]):
     """Signature of a custom command function for :func:`custom_command()`."""
 
     def __call__(
         self,
         prog: Program,
         name: str,
-        args: str,
+        args: T_contra,
         /,
         *,
         parser: argparse.ArgumentParser,
@@ -1009,7 +1112,8 @@ class CustomCommandFunc(Protocol):
         """
         :param prog: Program.
         :param name: Name that the command was invoked as.
-        :param args: Command arguments as a string.
+        :param args: Command arguments parsed by *parse* argument to
+            :func:`custom_command()`.
         :param parser: Argument parser.
 
         See :meth:`Command.run()` for other keyword parameters.
@@ -1019,19 +1123,51 @@ class CustomCommandFunc(Protocol):
         ...
 
 
-CustomCommandFuncDecorator = Callable[[CustomCommandFunc], CustomCommandFunc]
+CustomCommandFuncDecorator = Callable[[CustomCommandFunc[T]], CustomCommandFunc[T]]
 
 
-class _ArgparseCommandMixin:
+raw_command = functools.partial(custom_command, parse=ParsedCommand)
+"""
+Special case of :class:`custom_command()` where the arguments are the command
+string verbatim.
+
+Note that this cannot support redirections or pipes.
+
+.. code-block:: python3
+
+    from typing import Any
+
+    from drgn import Program
+    from drgn.commands import argument, raw_command
+
+
+    @raw_command(
+        description="display text verbatim",
+        arguments=(
+            argument("text", help="text to display"),
+        ),
+    )
+    def _cmd_echo(
+        prog: Program, name: str, args: str, **kwargs: Any
+    ) -> Any:
+        print(args)
+"""
+
+
+class _CustomCommand(Generic[T]):
     def __init__(
         self,
+        func: CustomCommandFunc[T],
         parser: argparse.ArgumentParser,
         description: str,
-        enabled: Optional[Callable[[Program], bool]] = None,
+        parse: Callable[[str], ParsedCommand[T]],
+        enabled: Callable[[Program], bool],
     ) -> None:
+        self._func = func
         self._parser = parser
         self._description = description
-        self.enabled = (lambda prog: True) if enabled is None else enabled
+        self.parse = parse
+        self.enabled = enabled
 
     def description(self) -> str:
         return self._description
@@ -1049,37 +1185,34 @@ class _ArgparseCommandMixin:
             help = help[len(usage) :].lstrip()
         return textwrap.indent(help, indent).rstrip()
 
+    def run(self, prog: Program, name: str, args: T, **kwargs: Any) -> Any:
+        return self._func(prog, name, args, **kwargs, parser=self._parser)
 
-class _ArgparseCommand(_ArgparseCommandMixin):
+
+class _ArgparseCommand(_CustomCommand[Sequence[str]]):
     def __init__(
         self,
         func: CommandFunc,
         parser: argparse.ArgumentParser,
         description: str,
-        enabled: Optional[Callable[[Program], bool]] = None,
+        enabled: Callable[[Program], bool],
     ) -> None:
-        super().__init__(parser, description, enabled)
-        self._func = func
+        super().__init__(
+            self._run_argparse, parser, description, parse_shell_command, enabled
+        )
+        self._argparse_func = func
 
-    def run(self, prog: Program, name: str, args: str, **kwargs: Any) -> Any:
-        with _shell_command(args) as parsed:
-            parsed_args = self._parser.parse_args(parsed.args)
-            return self._func(prog, name, parsed_args, **kwargs, parser=self._parser)
-
-
-class _CustomCommand(_ArgparseCommandMixin):
-    def __init__(
+    def _run_argparse(
         self,
-        func: CustomCommandFunc,
+        prog: Program,
+        name: str,
+        args: Sequence[str],
         parser: argparse.ArgumentParser,
-        description: str,
-        enabled: Optional[Callable[[Program], bool]] = None,
-    ) -> None:
-        super().__init__(parser, description, enabled)
-        self._func = func
-
-    def run(self, prog: Program, name: str, args: str, **kwargs: Any) -> Any:
-        return self._func(prog, name, args, **kwargs, parser=self._parser)
+        **kwargs: Any,
+    ) -> Any:
+        return self._argparse_func(
+            prog, name, parser.parse_args(args), **kwargs, parser=parser
+        )
 
 
 # Variant of repr() that prefers double-quoted strings (like Black).
@@ -1106,11 +1239,96 @@ class DrgnCodeBuilder:
         self._prog = prog
         self._code: List[str] = []
         self._imports: Dict[str, Set[str]] = collections.defaultdict(set)
+        self._blocks: List[DrgnCodeBlockContext] = []
 
     def append(self, code: str) -> None:
         """Append a code fragment to the output."""
-        if code:
+        if not code:
+            return
+
+        if not self._blocks:
             self._code.append(code)
+            return
+
+        indent = self._blocks[-1]._indent
+        should_indent = not self._code or self._code[-1].endswith("\n")
+        for line in code.splitlines(keepends=True):
+            if should_indent and line != "\n":
+                self._code.append(indent)
+
+            self._code.append(line)
+            should_indent = True
+
+    def begin_block(self, code: str, end: str = "") -> DrgnCodeBlockContext:
+        """
+        Append a code fragment that begins an indented block.
+
+        This can be used to wrap code that may or may not need to be executed
+        in a conditional or loop.
+
+        Subsequent lines added with :meth:`append()` will be indented
+        accordingly until the block is ended with :meth:`end_block()`:
+
+        .. code-block:: python3
+
+            if condition:
+                code.begin_block(f"if {condition}:\\n")
+            code.append("do_something()\\n")
+            if condition:
+                code.end_block()
+
+        Alternatively, this can be used as a context manager:
+
+        .. code-block:: python3
+
+            with code.begin_block(f"while {condition}:\\n")
+                code.append("do_something()\\n")
+
+        :param code: Code fragment whose last non-whitespace line begins the
+            block (e.g., an ``if`` or ``for`` statement). This can also be
+            empty to begin a "fake" block that doesn't affect indentation but
+            still pairs with a :meth:`end_block()` call.
+        :param end: Code fragment to append when the block is ended. This is
+            useful for ``try`` statements.
+        """
+        if code:
+            match = re.fullmatch(
+                r"""
+                # Skip everything until we find...
+                (?s:.)*
+                # ... the last line that is not only whitespace, and capture
+                # its indentation.
+                ^([ \t]*)\S.*\n
+                # Ignore zero or more trailing lines of only whitespace.
+                (?:\s*\n)?
+                """,
+                code,
+                flags=re.MULTILINE | re.VERBOSE,
+            )
+            if not match:
+                if code.endswith("\n"):
+                    raise ValueError("code is all whitespace")
+                else:
+                    raise ValueError("code does not end with newline")
+            indent = match.group(1) + "    "
+
+            self.append(code)
+        else:
+            indent = ""
+
+        if self._blocks:
+            indent = self._blocks[-1]._indent + indent
+        block = DrgnCodeBlockContext(self, indent, end)
+        self._blocks.append(block)
+        return block
+
+    def end_block(self) -> None:
+        """
+        End the most recently begun indented block.
+
+        See :meth:`begin_block()`.
+        """
+        self._blocks[-1].end()
 
     def add_import(self, module: str) -> None:
         """
@@ -1129,43 +1347,39 @@ class DrgnCodeBuilder:
         """
         self._imports[module].update(names)
 
-    def append_retry_loop_if_live(self, body: str, num_attempts: int) -> None:
+    def begin_retry_loop_if_live(self, num_attempts: int) -> "DrgnCodeBlockContext":
         """
-        Append a code fragment wrapped in a loop that retries on transient
-        :class:`~drgn.FaultError` or :class:`~drgn.helpers.ValidationError`
-        errors if the program is live.
+        Begin a loop that retries on transient :class:`~drgn.FaultError` or
+        :class:`~drgn.helpers.ValidationError` errors if the program is live.
 
-        If the program is not live, the code fragment is appended verbatim.
+        This must be paired with :meth:`end_block()` or used as a context
+        manager.
 
-        :param body: Code to attempt in loop body.
         :param num_attempts: Maximum number of attempts.
         """
-        self.append(self.wrap_retry_loop_if_live(body, num_attempts))
-
-    def wrap_retry_loop_if_live(self, body: str, num_attempts: int) -> str:
-        """
-        Like :meth:`append_retry_loop_if_live()`, but return the code fragment
-        instead of appending it.
-        """
         if not (self._prog.flags & ProgramFlags.IS_LIVE):
-            return body
+            return self.begin_block("")
+
         self.add_from_import("drgn", "FaultError")
         self.add_from_import("drgn.helpers", "ValidationError")
-        # Copy the indentation level.
-        indent = re.match(r"[ \t]*", body).group()  # type: ignore[union-attr]  # This regex always matches.
-        return f"""\
-{indent}# This is racy. Retry a limited number of times.
-{indent}for attempts_remaining in range({num_attempts}, 0, -1):
-{indent}    try:
-{textwrap.indent(body, "        ")}\
-{indent}        break
-{indent}    except (FaultError, ValidationError):
-{indent}        if attempts_remaining == 1:
-{indent}            raise
-"""
+        return self.begin_block(
+            f"""\
+# This is racy. Retry a limited number of times.
+for attempts_remaining in range({num_attempts}, 0, -1):
+    try:
+""",
+            """\
+        break
+    except (FaultError, ValidationError):
+        if attempts_remaining == 1:
+            raise
+""",
+        )
 
     def get(self) -> str:
         """Get the output as a string."""
+        assert not self._blocks
+
         parts: List[str] = []
         first_party_imports: List[str] = []
         for module, names in sorted(self._imports.items()):
@@ -1203,3 +1417,63 @@ class DrgnCodeBuilder:
     def print(self) -> None:
         """Write the output to standard output."""
         sys.stdout.write(self.get())
+
+
+class DrgnCodeBlockContext:
+    def __init__(self, builder: DrgnCodeBuilder, indent: str, end: str) -> None:
+        self._builder = builder
+        self._indent = indent
+        self._end = end
+
+    def end(self) -> None:
+        assert self._builder._blocks[-1] is self
+        self._builder.append(self._builder._blocks.pop()._end)
+
+    def __enter__(self) -> "Self":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.end()
+
+
+def _parse_py_command(
+    args: str,
+) -> ParsedCommand[Union[types.CodeType, SyntaxError, None]]:
+    for match in re.finditer(r"[|<>]", args):
+        try:
+            source = args[: match.start()]
+            if not source or source.isspace():
+                code = None
+            else:
+                code = compile(source, "<input>", "single")
+        except SyntaxError:
+            pass
+        else:
+            parsed = parse_shell_command(args[match.start() :])
+            if parsed.args:
+                # Don't allow extra arguments to be mixed in with redirections.
+                raise SyntaxError("py does not support arguments after redirections")
+            return dataclasses.replace(parsed, args=code)  # type: ignore[arg-type,return-value]
+    else:
+        # Fallback for no match: compile all the code as a "single" statement
+        # so exec() still prints out the result. If there is a syntax error,
+        # let the command handle it.
+        if not args or args.isspace():
+            return ParsedCommand(None)
+        try:
+            return ParsedCommand(compile(args, "<input>", "single"))
+        except SyntaxError as e:
+            return ParsedCommand(e)
+
+
+# Print an exception without our own compile() frame, which could confuse the
+# user.
+def _print_py_command_exception(exc: BaseException) -> None:
+    # Unfortunately, traceback objects are linked lists and there's no built-in
+    # functionality to drop the last N frames of a traceback while printing.
+    tb = exc.__traceback__
+    count = 0
+    while tb:
+        count += 1
+        tb = tb.tb_next
+    traceback.print_exception(type(exc), exc, exc.__traceback__, limit=1 - count)
